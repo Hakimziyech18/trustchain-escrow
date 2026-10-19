@@ -220,26 +220,51 @@ router.post('/jobs/:id/retry', async (req, res) => {
 /**
  * Clean up completed/failed jobs
  */
+// A cleanup request is deliberately bounded: at most 1,000 old terminal jobs
+// from one queue per invocation. In BullMQ clean(grace, limit, state), the
+// second argument is a removal limit, not a count of jobs to retain.
+const MAX_CLEANUP_JOBS = 1000;
+const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000;
+const MAX_RETENTION_MS = 30 * DEFAULT_RETENTION_MS;
+
 router.post('/cleanup', async (req, res) => {
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  // Keep the legacy 'keepLast' field to avoid changing callers. It means the
+  // maximum number *removed* in one request, not the number retained.
+  const {
+    state = 'completed',
+    keepLast = 100,
+    queue = 'main',
+    olderThanMs = DEFAULT_RETENTION_MS,
+  } = body;
+
+  if (
+    !['completed', 'failed'].includes(state) ||
+    !['main', 'dead-letter'].includes(queue) ||
+    !Number.isSafeInteger(keepLast) ||
+    keepLast < 1 ||
+    keepLast > MAX_CLEANUP_JOBS ||
+    !Number.isSafeInteger(olderThanMs) ||
+    olderThanMs < 60 * 1000 ||
+    olderThanMs > MAX_RETENTION_MS
+  ) {
+    return res.status(400).json({ error: 'Invalid cleanup parameters' });
+  }
+
   try {
-    const { state = 'completed', keepLast = 100, queue = 'main' } = req.body;
-
     const targetQueue = queue === 'dead-letter' ? deadLetterQueue : stellarEventsQueue;
-
-    let cleanedCount = 0;
-    if (state === 'completed') {
-      cleanedCount = await targetQueue.clean(0, keepLast, 'completed');
-    } else if (state === 'failed') {
-      cleanedCount = await targetQueue.clean(0, keepLast, 'failed');
-    }
-
-    res.json({
+    const removedJobIds = await targetQueue.clean(olderThanMs, keepLast, state);
+    // BullMQ clean() returns an array of removed job IDs. Never return IDs,
+    // payloads, error messages or raw dependencies to the dashboard.
+    if (!Array.isArray(removedJobIds)) throw new Error('Unexpected cleanup result');
+    const cleanedCount = removedJobIds.length;
+    return res.json({
       message: `Cleaned up ${cleanedCount} ${state} jobs`,
       cleanedCount,
     });
-  } catch (error) {
-    console.error('[Dashboard] Error cleaning up jobs:', error);
-    res.status(500).json({ error: 'Failed to cleanup jobs' });
+  } catch {
+    console.error('[Dashboard] Queue cleanup failed');
+    return res.status(500).json({ error: 'Failed to cleanup jobs' });
   }
 });
 
